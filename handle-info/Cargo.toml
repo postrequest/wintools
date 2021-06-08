@@ -1,0 +1,13 @@
+[package]
+name = "handle-info"
+version = "0.1.0"
+authors = ["post"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = "2.33"
+ntapi = "0.3"
+prettytable-rs = "0.8"
+winapi = { version = "0.3", features = ["heapapi", "ntstatus"] }
