@@ -1,19 +1,60 @@
 use clap::{App, Arg};
-use ntapi::ntexapi::{NtQuerySystemInformation, PSYSTEM_HANDLE_INFORMATION, SYSTEM_HANDLE_TABLE_ENTRY_INFO};
+use ntapi::{
+    ntapi_base::CLIENT_ID,
+    ntexapi::{
+        NtQuerySystemInformation,
+        PSYSTEM_HANDLE_INFORMATION,
+        SYSTEM_HANDLE_TABLE_ENTRY_INFO
+    },
+    ntobapi::{
+        NtDuplicateObject,
+        NtQueryObject,
+        POBJECT_NAME_INFORMATION,
+    },
+    ntpsapi::NtOpenProcess,
+};
 use prettytable::{format, Table};
 use std::{
     env::args,
+    ffi::OsStr,
+    mem::size_of,
+    os::windows::ffi::OsStrExt,
     process::exit,
     slice::from_raw_parts_mut,
 };
 use winapi::{
     shared::{
-        ntdef::ULONG,
-        ntstatus::STATUS_INFO_LENGTH_MISMATCH,
+        ntdef::{
+            HANDLE, 
+            LUID, 
+            NT_SUCCESS,
+            OBJECT_ATTRIBUTES, 
+            ULONG,
+        },
+        ntstatus::{
+            STATUS_BUFFER_OVERFLOW,
+            STATUS_BUFFER_TOO_SMALL,
+            STATUS_INFO_LENGTH_MISMATCH,
+        },
+        winerror::ERROR_NOT_ALL_ASSIGNED,
     },
     um::{
-        heapapi::{GetProcessHeap, HeapAlloc, HeapReAlloc},
-        winnt::HEAP_ZERO_MEMORY,
+        errhandlingapi::GetLastError,
+        handleapi::CloseHandle,
+        heapapi::{GetProcessHeap, HeapAlloc, HeapFree, HeapReAlloc},
+        processthreadsapi::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken},
+        securitybaseapi::AdjustTokenPrivileges,
+        winbase::LookupPrivilegeValueW,
+        winnt::{
+            HEAP_ZERO_MEMORY,
+            LUID_AND_ATTRIBUTES, 
+            PROCESS_DUP_HANDLE,
+            SE_DEBUG_NAME,
+            SE_PRIVILEGE_ENABLED,
+            TOKEN_ADJUST_PRIVILEGES,
+            TOKEN_PRIVILEGES,
+            TOKEN_QUERY,
+        },
     }
 };
 
@@ -118,7 +159,155 @@ fn granted_access(access: ULONG) -> String {
     }
 }
 
-fn get_handles(pid: u32) {
+pub fn get_wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn enable_sedebug() -> bool {
+    // Obtain token handle
+    let mut h_token: HANDLE = 0 as _;
+    let _ = unsafe { OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &mut h_token,
+    )};
+
+    // Required privilege
+    let privs = LUID_AND_ATTRIBUTES {
+        Luid: LUID { 
+            LowPart: 0, 
+            HighPart: 0,
+        },
+        Attributes: SE_PRIVILEGE_ENABLED,
+    };
+    let mut tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [privs ;1],
+    };
+    let _ = unsafe { LookupPrivilegeValueW(
+        0 as _,
+        get_wide(SE_DEBUG_NAME).as_mut_ptr(),
+        &mut tp.Privileges[0].Luid,
+    )};
+
+    // Enable the privilege
+    let _ = unsafe { AdjustTokenPrivileges(
+        h_token,
+        false as _,
+        &mut tp,
+        size_of::<TOKEN_PRIVILEGES>() as _,
+        0 as _,
+        0 as _,
+    )};
+
+    // Check if privilege was enabled
+    if unsafe{ GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+        println!("{:?} not assigned: Please run as Administrator", SE_DEBUG_NAME);
+        return false
+    }
+    let _ = unsafe { CloseHandle(h_token) };
+
+    return true
+}
+
+fn handle_name(pid: u32, wanted_handle: HANDLE) -> String {
+    let mut dup_handle: HANDLE = 0 as _;
+    let mut handle: HANDLE = 0 as _;
+
+    // Obtain remote HANDLE
+    if pid == unsafe { GetCurrentProcessId() } {
+        handle = unsafe { GetCurrentProcess() };
+        dup_handle = handle;
+    } else {
+        // use NtOpenProcess because OpenProcess does not allow HANDLEs for SYSTEM processes
+        let mut oa = OBJECT_ATTRIBUTES{ 
+            Length: 0 as _,
+            RootDirectory: 0 as _,
+            ObjectName: 0 as _,
+            Attributes: 0 as _,
+            SecurityDescriptor: 0 as _,
+            SecurityQualityOfService: 0 as _,
+        };
+        let mut cid = CLIENT_ID {
+            UniqueProcess: pid as _,
+            UniqueThread: 0 as _,
+        };
+        let op_status = unsafe { NtOpenProcess(
+            &mut handle,
+            PROCESS_DUP_HANDLE,
+            &mut oa,
+            &mut cid,
+        )};
+        if !NT_SUCCESS(op_status) {
+            return "".to_string()
+        }
+        let status = unsafe { NtDuplicateObject(
+            handle,
+            wanted_handle,
+            GetCurrentProcess(),
+            &mut dup_handle,
+            0 as _,
+            0 as _,
+            0 as _,
+        )};
+        if !NT_SUCCESS(status) {
+            return "".to_string()
+        }
+    }
+
+    // allocate buffer
+    let mut ret_len: ULONG = 0;
+    let mut bufsize: usize = 0x1000;
+    let mut buf = unsafe { HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        bufsize,
+    )};
+    // Obtain OBJECT_NAME_INFORMATION
+    loop {
+        let status = unsafe { NtQueryObject(
+            dup_handle,
+            1,
+            buf,
+            bufsize as _,
+            &mut ret_len,
+        )};
+        if status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL || status == STATUS_INFO_LENGTH_MISMATCH {
+            bufsize = bufsize * 2;
+            buf = unsafe { HeapReAlloc(
+                GetProcessHeap(),
+                0 as _,
+                buf,
+                bufsize,
+            )};
+        } else {
+            if !NT_SUCCESS(status) {
+                return "".to_string()
+            }
+            break;
+        }
+    }
+
+    // convert UNICODE_STRING to String and return
+    let p_obi = buf as POBJECT_NAME_INFORMATION;
+    let obi = unsafe { *p_obi };
+    let unicode_str: &[u16] = unsafe {
+        from_raw_parts_mut(obi.Name.Buffer, obi.Name.MaximumLength as _)
+    };
+    let name = String::from_utf16_lossy(unicode_str);
+    let _ = unsafe { HeapFree(
+        GetProcessHeap(),
+        0 as _,
+        buf,
+    )};
+    //if name.len() == 0 {
+    //    return "NoData".to_string()
+    //} 
+    format!("{}", name)
+    // processhacker/phlib/hndlinfo.c L1619 -> L161 basic || L363 name
+}
+
+fn get_handles(pid: u32, filter: String) {
     // allocate buffer
     let mut bufsize: usize = 0x4000;
     let mut buf = unsafe { HeapAlloc(
@@ -147,26 +336,51 @@ fn get_handles(pid: u32) {
     let handle_list_ptr = buf as PSYSTEM_HANDLE_INFORMATION;
     let handle_list_tmp = unsafe{ *handle_list_ptr };
     let num_handles = handle_list_tmp.NumberOfHandles as usize;
-    let handle_list: &mut [SYSTEM_HANDLE_TABLE_ENTRY_INFO] = unsafe { from_raw_parts_mut(handle_list_ptr.offset(4) as _, num_handles) };
+    let handle_list: &mut [SYSTEM_HANDLE_TABLE_ENTRY_INFO] = unsafe { 
+        from_raw_parts_mut(handle_list_ptr.offset(4) as _, num_handles) 
+    };
 
     // iterate over handles
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_BORDER);
-    table.add_row(row!["PID", "ObjectTypeIndex", "HandleValue", "Object", "GrantedAccess", "CreatorBackTraceIndex", "HandleAttributes"]);
+    if pid != 0 {
+        table.add_row(row!["PID", "ObjectTypeIndex", "HandleValue", "HandleName", "Object", "GrantedAccess", "CreatorBackTraceIndex", "HandleAttributes"]);
+    } else {
+        table.add_row(row!["PID", "ObjectTypeIndex", "HandleValue", "Object", "GrantedAccess", "CreatorBackTraceIndex", "HandleAttributes"]);
+    }
     for i in 0..num_handles {
         let current_handle = handle_list[i as usize];
+        // check for PID
         if (pid != 0) && !(current_handle.UniqueProcessId as u32 == pid) {
             continue;
         }
-        table.add_row(row![
-            current_handle.UniqueProcessId,
-            handle_type(current_handle.ObjectTypeIndex),
-            format!("{:#x}", current_handle.HandleValue),
-            format!("{:?}", current_handle.Object),
-            granted_access(current_handle.GrantedAccess),
-            format!("{:#x}", current_handle.CreatorBackTraceIndex),
-            format!("{:#x}", current_handle.HandleAttributes),
-        ]);
+        // check for filter
+        if (filter != "".to_string()) && (handle_type(current_handle.ObjectTypeIndex) != filter) {
+            continue;
+        }
+        // update table
+        if pid != 0 {
+            table.add_row(row![
+                current_handle.UniqueProcessId,
+                handle_type(current_handle.ObjectTypeIndex),
+                format!("{:#x}", current_handle.HandleValue),
+                handle_name(current_handle.UniqueProcessId as _, current_handle.HandleValue as _),
+                format!("{:?}", current_handle.Object),
+                granted_access(current_handle.GrantedAccess),
+                format!("{:#x}", current_handle.CreatorBackTraceIndex),
+                format!("{:#x}", current_handle.HandleAttributes),
+            ]);
+        } else {
+            table.add_row(row![
+                current_handle.UniqueProcessId,
+                handle_type(current_handle.ObjectTypeIndex),
+                format!("{:#x}", current_handle.HandleValue),
+                format!("{:?}", current_handle.Object),
+                granted_access(current_handle.GrantedAccess),
+                format!("{:#x}", current_handle.CreatorBackTraceIndex),
+                format!("{:#x}", current_handle.HandleAttributes),
+            ]);
+        }
     }
     // print to stdout
     table.printstd();
@@ -186,11 +400,21 @@ fn main() {
             .takes_value(true)
             .required(false)
         )
+        .arg(
+            Arg::with_name("filter")
+            .long("filter")
+            .short("f")
+            .takes_value(true)
+            .required(false)
+            .help("ALPC, Composition, CoreMessaging, Desktop, Directory, DxgkDisplayManagerObject, DxgkSharedResource, DxgkSharedSyncObject, EnergyTracker, EtwConsumer, EtwRegistration, Event, Event, File, FilterCommunicationPort, FilterConnectionPort, IoCompletion, IoCompletionReserve, IRTimer, Job, Key, KeyedEvent, Mutant, Partition, PcwObject, PowerRequest, Process, RawInputManager, Section, Semaphore, Session, SymbolicLink, Thread, Timer, TmRm, TmTm, Token, TpWorkerFactory, WaitCompletionPacket, WindowStation, WmiGuid")
+        )
     ;
     if args().count() < 1 {
         app.print_help().expect("Error loading help");
         exit(1);
     }
+
+    // parse args
     let matches = app.get_matches();
     let pid = if matches.is_present("pid") {
         let pid_str = matches.value_of("pid").unwrap();
@@ -202,5 +426,17 @@ fn main() {
     } else {
         0
     };
-    get_handles(pid);
+    let filter = if matches.is_present("filter") {
+        let pid_str = matches.value_of("filter").unwrap();
+        pid_str.to_string()
+    } else {
+        "".to_string()
+    };
+
+    // Enable privs
+    if !enable_sedebug() {
+        return
+    }
+
+    get_handles(pid, filter);
 }
